@@ -40,6 +40,7 @@ use crate::example_components::{
     tabs::TabsShowcaseDestination, text::TextShowcaseDestination,
     text_editor::TextEditorShowcaseDestination,
 };
+use crate::example_components::syntax_editor::SyntaxEditorShowcaseDestination;
 
 #[derive(Default)]
 struct AppState {
@@ -210,6 +211,15 @@ fn home(
             || {
                 Router::with_mut(|router| {
                     router.push(TextEditorShowcaseDestination {});
+                });
+            },
+        ),
+        ComponentExampleDesc::new(
+            "Syntax Editor",
+            "A basic syntax aware text editor.",
+            || {
+                Router::with_mut(|router| {
+                    router.push(SyntaxEditorShowcaseDestination {});
                 });
             },
         ),

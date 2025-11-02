@@ -14,7 +14,7 @@
 //! Most applications should interact with [`TextEditorState`] for state management and [`text_edit_core()`]
 //! for rendering and layout within a component tree.
 
-mod cursor;
+pub mod cursor;
 
 use std::{sync::Arc, time::Instant};
 

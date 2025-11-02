@@ -87,4 +87,6 @@ pub mod switch;
 pub mod tabs;
 pub mod text;
 mod text_edit_core;
+mod syntax_edit_core;
 pub mod text_editor;
+pub mod syntax_editor;

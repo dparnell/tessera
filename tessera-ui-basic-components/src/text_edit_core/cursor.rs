@@ -11,7 +11,7 @@ use tessera_ui::{Color, ComputedData, Dp, Px, tessera};
 use crate::pipelines::ShapeCommand;
 
 /// Width of the text cursor in device-independent pixels.
-pub(crate) const CURSOR_WIDRH: Dp = Dp(2.5);
+pub const CURSOR_WIDRH: Dp = Dp(2.5);
 
 /// A blinking cursor component for text editing interfaces.
 ///
@@ -49,7 +49,7 @@ pub(crate) const CURSOR_WIDRH: Dp = Dp(2.5);
 /// - No corner radius (sharp rectangular appearance)
 /// - No shadow effects
 #[tessera]
-pub(super) fn cursor(height_px: Px, bink_timer: Instant) {
+pub fn cursor(height_px: Px, bink_timer: Instant) {
     // Skip rendering the cursor during the "off" phase of the blink cycle
     // to create the blinking effect (visible for 500ms, hidden for 500ms)
     if bink_timer.elapsed().as_millis() % 1000 < 500 {
