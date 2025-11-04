@@ -2,7 +2,7 @@ use std::{any::TypeId, mem, sync::Arc};
 
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
-use wgpu::{ImageSubresourceRange, TextureFormat};
+use wgpu::TextureFormat;
 use winit::window::Window;
 
 use crate::{
@@ -10,10 +10,13 @@ use crate::{
     compute::resource::ComputeResourceManager,
     dp::SCALE_FACTOR,
     px::{PxRect, PxSize},
-    renderer::command::{BarrierRequirement, Command},
+    renderer::command::{AsAny, BarrierRequirement, Command},
 };
 
-use super::{compute::ComputePipelineRegistry, drawer::Drawer};
+use super::{
+    compute::{ComputePipelineRegistry, ErasedComputeBatchItem},
+    drawer::Drawer,
+};
 
 // WGPU context for ping-pong operations
 struct WgpuContext<'a> {
@@ -50,6 +53,9 @@ struct DoComputeParams<'a> {
     scene_view: &'a wgpu::TextureView,
     target_a: &'a wgpu::TextureView,
     target_b: &'a wgpu::TextureView,
+    blit_bind_group_layout: &'a wgpu::BindGroupLayout,
+    blit_sampler: &'a wgpu::Sampler,
+    compute_blit_pipeline: &'a wgpu::RenderPipeline,
 }
 
 // Compute resources for ping-pong operations
@@ -100,6 +106,7 @@ pub struct WgpuApp {
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
+    compute_blit_pipeline: wgpu::RenderPipeline,
 }
 
 impl WgpuApp {
@@ -293,6 +300,28 @@ impl WgpuApp {
             cache: None,
         });
 
+        let compute_blit_pipeline = gpu.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Compute Copy Pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(TextureFormat::Rgba8Unorm.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             window,
             gpu,
@@ -314,6 +343,7 @@ impl WgpuApp {
             blit_pipeline,
             blit_bind_group_layout,
             blit_sampler,
+            compute_blit_pipeline,
         }
     }
 
@@ -475,6 +505,7 @@ impl WgpuApp {
         blit_bind_group_layout: &wgpu::BindGroupLayout,
         blit_sampler: &wgpu::Sampler,
         blit_pipeline: &wgpu::RenderPipeline,
+        compute_blit_pipeline: &wgpu::RenderPipeline,
     ) -> wgpu::TextureView {
         let blit_bind_group = context.gpu.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: blit_bind_group_layout,
@@ -536,6 +567,9 @@ impl WgpuApp {
                 scene_view: offscreen_texture,
                 target_a: compute_resources.compute_target_a,
                 target_b: compute_resources.compute_target_b,
+                blit_bind_group_layout,
+                blit_sampler,
+                compute_blit_pipeline,
             })
         } else {
             // Return an owned clone so caller does not keep a borrow on read_target
@@ -661,6 +695,7 @@ impl WgpuApp {
                         &self.blit_bind_group_layout,
                         &self.blit_sampler,
                         &self.blit_pipeline,
+                        &self.compute_blit_pipeline,
                     );
                     scene_texture_view = final_view_after_compute;
                 }
@@ -751,6 +786,7 @@ impl WgpuApp {
                     &self.blit_bind_group_layout,
                     &self.blit_sampler,
                     &self.blit_pipeline,
+                    &self.compute_blit_pipeline,
                 );
                 scene_texture_view = final_view_after_compute;
             }
@@ -789,23 +825,84 @@ impl WgpuApp {
             return params.scene_view.clone();
         }
 
-        let mut read_view = params.scene_view.clone();
-        let (mut write_target, mut read_target) = (params.target_a, params.target_b);
+        let texture_size = wgpu::Extent3d {
+            width: params.config.width,
+            height: params.config.height,
+            depth_or_array_layers: 1,
+        };
 
-        for (command, size, start_pos) in params.commands {
-            // Ensure the write target is cleared before use
-            params.encoder.clear_texture(
-                write_target.texture(),
-                &ImageSubresourceRange {
-                    aspect: wgpu::TextureAspect::All,
-                    base_mip_level: 0,
-                    mip_level_count: None,
-                    base_array_layer: 0,
-                    array_layer_count: None,
-                },
+        Self::blit_to_view(
+            params.encoder,
+            params.gpu,
+            params.scene_view,
+            params.target_a,
+            params.blit_bind_group_layout,
+            params.blit_sampler,
+            params.compute_blit_pipeline,
+        );
+
+        let mut read_view = params.target_a.clone();
+        let mut write_target = params.target_b;
+        let mut read_target = params.target_a;
+
+        let mut index = 0;
+        while index < params.commands.len() {
+            let (command, size, start_pos) = &params.commands[index];
+            let type_id = AsAny::as_any(&**command).type_id();
+
+            let mut batch_items: Vec<ErasedComputeBatchItem<'_>> = Vec::new();
+            let mut batch_areas: Vec<PxRect> = Vec::new();
+            let mut cursor = index;
+
+            while cursor < params.commands.len() {
+                let (candidate_command, candidate_size, candidate_pos) = &params.commands[cursor];
+                if AsAny::as_any(&**candidate_command).type_id() != type_id {
+                    break;
+                }
+
+                let area = extract_draw_rect(
+                    Some(candidate_command.barrier()),
+                    *candidate_size,
+                    *candidate_pos,
+                    texture_size,
+                );
+
+                if batch_areas
+                    .iter()
+                    .any(|existing| rects_overlap(*existing, area))
+                {
+                    break;
+                }
+
+                batch_areas.push(area);
+                batch_items.push(ErasedComputeBatchItem {
+                    command: &**candidate_command,
+                    size: *candidate_size,
+                    position: *candidate_pos,
+                    target_area: area,
+                });
+                cursor += 1;
+            }
+
+            if batch_items.is_empty() {
+                let area =
+                    extract_draw_rect(Some(command.barrier()), *size, *start_pos, texture_size);
+                batch_items.push(ErasedComputeBatchItem {
+                    command: &**command,
+                    size: *size,
+                    position: *start_pos,
+                    target_area: area,
+                });
+                batch_areas.push(area);
+                cursor = index + 1;
+            }
+
+            params.encoder.copy_texture_to_texture(
+                read_view.texture().as_image_copy(),
+                write_target.texture().as_image_copy(),
+                texture_size,
             );
 
-            // Create and dispatch the compute pass
             {
                 let mut cpass = params
                     .encoder
@@ -814,39 +911,85 @@ impl WgpuApp {
                         timestamp_writes: None,
                     });
 
-                // Get the area of the compute command (reuse extract_draw_rect to avoid duplication)
-                let texture_size = wgpu::Extent3d {
-                    width: params.config.width,
-                    height: params.config.height,
-                    depth_or_array_layers: 1,
-                };
-                let area =
-                    extract_draw_rect(Some(command.barrier()), size, start_pos, texture_size);
-
                 params.compute_pipeline_registry.dispatch_erased(
                     params.gpu,
                     params.queue,
                     params.config,
                     &mut cpass,
-                    &*command,
+                    &batch_items,
                     params.resource_manager,
-                    area,
                     &read_view,
                     write_target,
                 );
-            } // cpass is dropped here, ending the pass
+            }
 
-            // The result of this pass is now in write_target.
-            // For the next iteration, this will be our read source.
             read_view = write_target.clone();
-            // Swap targets for the next iteration
             std::mem::swap(&mut write_target, &mut read_target);
+            index = cursor;
         }
 
         // After the loop, the final result is in the `read_view`,
         // because we swapped one last time at the end of the loop.
         read_view
     }
+
+    fn blit_to_view(
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        source: &wgpu::TextureView,
+        target: &wgpu::TextureView,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        pipeline: &wgpu::RenderPipeline,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+            label: Some("Compute Copy Bind Group"),
+        });
+
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Compute Copy Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+
+        rpass.set_pipeline(pipeline);
+        rpass.set_bind_group(0, &bind_group, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+}
+
+fn rects_overlap(a: PxRect, b: PxRect) -> bool {
+    let a_left = a.x.0;
+    let a_top = a.y.0;
+    let a_right = a_left + a.width.0;
+    let a_bottom = a_top + a.height.0;
+
+    let b_left = b.x.0;
+    let b_top = b.y.0;
+    let b_right = b_left + b.width.0;
+    let b_bottom = b_top + b.height.0;
+
+    !(a_right <= b_left || b_right <= a_left || a_bottom <= b_top || b_bottom <= a_top)
 }
 
 fn compute_padded_rect(

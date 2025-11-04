@@ -13,30 +13,36 @@ struct Uniforms {
 @group(0) @binding(2) var dest_texture: texture_storage_2d<rgba8unorm, write>;
 
 fn gaussian_blur(coord: vec2<u32>, direction: vec2<f32>, texture_size: vec2<u32>) -> vec4<f32> {
-    var total = vec4<f32>(0.0);
-    var total_weight = 0.0;
-    
-    // Use the original float radius for better precision
-    let float_radius = uniforms.radius;
-    let radius = i32(ceil(float_radius));
+    let base_radius = max(uniforms.radius, 0.0);
+    let radius = i32(ceil(base_radius));
+    let clamped_radius = clamp(radius, 0, 15);
 
-    let clamped_radius = clamp(radius, 1, 15); // Minimum radius of 1 to avoid division by zero
-    let sigma = max(float_radius / 3.0, 0.5); // Minimum sigma to avoid division by zero
+    if clamped_radius == 0 {
+        return textureLoad(source_texture, coord, 0);
+    }
+
+    let sigma = max(base_radius / 3.0, 0.1);
     let two_sigma_squared = 2.0 * sigma * sigma;
 
-    for (var i = -clamped_radius; i <= clamped_radius; i = i + 1) {
-        let offset = direction * f32(i);
-        let sample_coord = clamp(
-            vec2<i32>(coord) + vec2<i32>(offset),
-            vec2<i32>(0),
-            vec2<i32>(texture_size) - vec2<i32>(1)
-        );
-        
-        // Calculate Gaussian weight
-        let distance_squared = f32(i * i);
-        let weight = exp(-distance_squared / two_sigma_squared);
+    var total = vec4<f32>(0.0);
+    var total_weight = 0.0;
 
-        let sample_color = textureLoad(source_texture, vec2<u32>(sample_coord), 0);
+    let dir = vec2<i32>(i32(round(direction.x)), i32(round(direction.y)));
+    let coord_i = vec2<i32>(coord);
+    let texture_size_i = vec2<i32>(texture_size);
+
+    for (var i = -clamped_radius; i <= clamped_radius; i = i + 1) {
+        let sample_coord = coord_i + dir * i;
+        let sample_clamped = clamp(
+            sample_coord,
+            vec2<i32>(0, 0),
+            texture_size_i - vec2<i32>(1, 1),
+        );
+
+        let distance = f32(i);
+        let weight = exp(-(distance * distance) / two_sigma_squared);
+
+        let sample_color = textureLoad(source_texture, vec2<u32>(sample_clamped), 0);
         total = total + sample_color * weight;
         total_weight = total_weight + weight;
     }
@@ -47,15 +53,18 @@ fn gaussian_blur(coord: vec2<u32>, direction: vec2<f32>, texture_size: vec2<u32>
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let output_size = textureDimensions(dest_texture);
-    let local = global_id.xy;
+    let coord = global_id.xy;
 
-    if local.x >= uniforms.area_width || local.y >= uniforms.area_height {
+    if coord.x >= output_size.x || coord.y >= output_size.y {
         return;
     }
 
-    let coord = vec2<u32>(uniforms.area_x, uniforms.area_y) + local;
+    let inside_area = coord.x >= uniforms.area_x
+        && coord.x < uniforms.area_x + uniforms.area_width
+        && coord.y >= uniforms.area_y
+        && coord.y < uniforms.area_y + uniforms.area_height;
 
-    if coord.x >= output_size.x || coord.y >= output_size.y {
+    if !inside_area {
         return;
     }
 
